@@ -1,0 +1,7 @@
+name = "seller-api"
+main = "worker.js"
+compatibility_date = "2026-10-19"
+
+[[kv_namespaces]]
+binding = "PORTAL"
+id = "1ed2126e01ef4891be0ce12890136b03"
