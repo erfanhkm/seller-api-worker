@@ -1,7 +1,19 @@
 // seller-api worker — seller portal backend for virtual tours.
 // KV binding: PORTAL (same namespace as the advisor worker's LEADS binding;
 //   keys: seller:<email>, stok:<token>, tour:<listingId>, tok:<advisor-token>,
-//         pano:<listingId>/<id>.jpg  — panorama binaries stored in KV)
+//         pano:<listingId>/<id>.jpg  (panorama binaries, stored in KV —
+//         R2 was dropped because activation requires a payment method)
+//
+// Endpoints:
+//   GET  /api/health                              (public)
+//   POST /api/seller/invite  {email,listingId}    (advisor auth)
+//   POST /api/seller/login   {email,password}     (public, rate-limited)
+//   GET  /api/seller/me                           (seller auth)
+//   POST /api/seller/panorama  (multipart, file)  (seller auth)
+//   DELETE /api/seller/panorama/:id               (seller auth)
+//   GET  /api/seller/tour                         (seller auth)
+//   PUT  /api/seller/tour {rooms,hotspots,enabled,videoUrl} (seller auth)
+//   GET  /api/tour/:listingId                     (public — main site viewer)
 
 const ALLOWED_ORIGINS = [
   'https://real-estate-platform-0aei.onrender.com',
@@ -54,6 +66,7 @@ function bearerToken(request) {
   const m = h.match(/^Bearer ([0-9a-f]{64})$/);
   return m ? m[1] : null;
 }
+// Advisor tokens live as tok:<token> in the shared KV (created by advisor-api).
 async function advisorAuthed(request, env) {
   const t = bearerToken(request);
   if (!t) return false;
@@ -76,7 +89,7 @@ async function sellerAuthed(request, env) {
     await env.PORTAL.delete('stok:' + t).catch(() => {});
     return null;
   }
-  return s;
+  return s; // {email, listingId}
 }
 function emailOk(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
 
@@ -120,6 +133,7 @@ export default {
     try {
       if (path === '/api/health') return json({ ok: true }, 200, origin);
 
+      // ---- advisor: invite a seller (creates seller account) ----
       if (path === '/api/seller/invite' && request.method === 'POST') {
         if (!(await advisorAuthed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         let d = null;
@@ -129,13 +143,15 @@ export default {
         const listingId = String(d.listingId || '').trim().slice(0, 40);
         if (!emailOk(email) || !listingId) return json({ ok: false, error: 'validation' }, 400, origin);
         if (await env.PORTAL.get('seller:' + email)) return json({ ok: false, error: 'exists' }, 400, origin);
-        const password = 'sel-' + randHex(12);
+        const password = (typeof d.password === 'string' && d.password.length >= 4 && d.password.length <= 100) ? d.password : 'sel-' + randHex(12);
         const salt = randHex(16);
         const hash = await sha256hex(salt + ':' + password);
         await env.PORTAL.put('seller:' + email, JSON.stringify({ email: email, salt: salt, hash: hash, listingId: listingId, created_at: new Date().toISOString() }));
+        // NOTE: password is returned ONCE here; the advisor hands it to the seller.
         return json({ ok: true, email: email, password: password, listingId: listingId }, 200, origin);
       }
 
+      // ---- seller: login ----
       if (path === '/api/seller/login' && request.method === 'POST') {
         if (limited(ip, 10, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         let d = null;
@@ -148,11 +164,12 @@ export default {
         const good = s && pw && timingSafeEqual(await sha256hex(s.salt + ':' + pw), s.hash);
         if (!good) return json({ ok: false, error: 'invalid' }, 401, origin);
         const token = randHex(32);
-        const exp = Date.now() + 7 * 86400 * 1000;
+        const exp = Date.now() + 7 * 86400 * 1000; // 7 days
         await env.PORTAL.put('stok:' + token, JSON.stringify({ email: email, listingId: s.listingId, exp: exp }), { expirationTtl: 7 * 86400 });
         return json({ ok: true, token: token, listingId: s.listingId }, 200, origin);
       }
 
+      // ---- seller authed routes ----
       const seller = await sellerAuthed(request, env);
       const needSeller = path.startsWith('/api/seller/') && path !== '/api/seller/login' && path !== '/api/seller/invite';
       if (needSeller && !seller) return json({ ok: false, error: 'unauthorized' }, 401, origin);
@@ -181,6 +198,7 @@ export default {
       if (m && request.method === 'DELETE') {
         const key = seller.listingId + '/' + m[1] + '.jpg';
         await env.PORTAL.delete('pano:' + key).catch(() => {});
+        // also drop the room referencing it
         const tkey = 'tour:' + seller.listingId;
         const tour = sanitizeTour(await env.PORTAL.get(tkey, { type: 'json' }));
         tour.rooms = tour.rooms.filter(r => r.id !== m[1]);
@@ -202,6 +220,7 @@ export default {
         return json({ ok: true, tour: tour }, 200, origin);
       }
 
+      // ---- public: tour for the main-site viewer ----
       m = path.match(/^\/api\/tour\/([A-Za-z0-9-]+)$/);
       if (m && request.method === 'GET') {
         const tour = sanitizeTour(await env.PORTAL.get('tour:' + m[1], { type: 'json' }));
@@ -209,6 +228,7 @@ export default {
         return json({ ok: true, tour: tour }, 200, origin);
       }
 
+      // ---- public: panorama image served from KV ----
       m = path.match(/^\/api\/pano\/([A-Za-z0-9-]+\/[A-Za-z0-9-]+\.jpg)$/);
       if (m && request.method === 'GET') {
         const img = await env.PORTAL.get('pano:' + m[1], { type: 'arrayBuffer' });
