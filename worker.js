@@ -65,19 +65,33 @@ function bearerToken(request) {
   const m = h.match(/^Bearer ([0-9a-f]{64})$/);
   return m ? m[1] : null;
 }
-// Admin tokens live as tok:<token> in the shared KV (created by advisor-api login).
+async function sha256hex(s) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(s)));
+  return [...new Uint8Array(buf)].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+// Admin session records live as 'tok:' + sha256hex(token) in the shared KV
+// (created by advisor-api login; Pack PMV1, 2026-11-09). Pack SessFix2
+// (2026-11-10): this worker still read the legacy RAW key 'tok:' + token,
+// so EVERY valid portal session 401'd here — and the portal's warm boot
+// wave calls GET /api/admin/tours through its sign-out-on-401 fetch
+// wrapper, which kicked the owner out seconds after every login. Hash
+// the presented token exactly like the advisor worker (adminTokKeys).
+// No ladder here by design: the record is hours old by the time tours
+// load, so read-after-write lag does not apply; the portal's own retry
+// covers a transient miss. See portal-session-bug-2026-11-10.md.
 async function adminAuthed(request, env) {
   const t = bearerToken(request);
   if (!t) return false;
-  const exp = await env.PORTAL.get('tok:' + t);
+  const key = 'tok:' + await sha256hex(t);
+  const exp = await env.PORTAL.get(key);
   if (!exp) return false;
   const expMs = parseInt(exp, 10);
   if (!Number.isFinite(expMs)) {
-    await env.PORTAL.delete('tok:' + t).catch(() => {});
+    await env.PORTAL.delete(key).catch(() => {});
     return false;
   }
   if (Date.now() > expMs) {
-    await env.PORTAL.delete('tok:' + t).catch(() => {});
+    await env.PORTAL.delete(key).catch(() => {});
     return false;
   }
   return true;
