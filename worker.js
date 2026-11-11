@@ -18,6 +18,8 @@
 
 const ALLOWED_ORIGINS = [
   'https://real-estate-platform-0aei.onrender.com',
+  'https://ehrealtybc.com',
+  'https://www.ehrealtybc.com',
   'https://muse.ai',
   'https://advisor-api.erfanbillion.workers.dev'
 ];
